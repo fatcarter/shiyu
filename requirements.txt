@@ -1,0 +1,9 @@
+# 只有 decrypt/ 需要第三方依赖(search/ 与 wwconfig.py 仅用标准库)。
+#   pip install -r requirements.txt
+# 系统 python3 直接跑检索, 但 decrypt/ 建议用虚拟环境:
+#   python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+pycryptodome>=3.20     # decrypt/wxwork_crypto.py 的 AES 后端(cryptography 未装时使用)
+
+# 可选: keys/explore/ 里的 Mach-O 反汇编辅助脚本(disas.py / blxref.py)才用得到
+capstone>=5.0

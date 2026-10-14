@@ -1,0 +1,11 @@
+# 构建上下文只留镜像里真正要的东西: 27GB 的 data/ 和密钥都不参与构建
+data/
+keys/
+.venv/
+*.log
+*.md
+.git/
+.gitignore
+.DS_Store
+__pycache__/
+*.pyc

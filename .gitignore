@@ -1,0 +1,32 @@
+# ── 私人数据与密钥: 绝不入库 ─────────────────────────────
+# data/ 是解密结果与附件备份, keys/wxwork_keys.json 是数据库密钥
+
+data/
+keys/wxwork_keys.json
+
+# ── 编译产物与可再生成的文件: 用脚本重建即可 ────────────────
+# 注意: .gitignore 不支持行尾注释, 规则与注释必须分行写
+
+# make_dev_app.sh 生成的重签名副本
+keys/WeCom-dev.app/
+
+# build_wckey.sh 编译产物
+keys/wckey
+keys/explore/dbg
+
+# 运行日志与临时备份
+keys/logs/
+
+# ── 环境 ────────────────────────────────────────────────
+
+.venv/
+.env
+.env.*
+__pycache__/
+*.py[cod]
+
+# ── 杂项 ────────────────────────────────────────────────
+
+*.log
+*.bak
+.DS_Store

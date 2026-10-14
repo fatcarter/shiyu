@@ -1,0 +1,22 @@
+# 拾语 (Shiyu) — 检索 Web UI
+#
+#   docker compose up -d            → http://127.0.0.1:8765
+#   docker compose logs -f
+#   docker compose down
+#
+# 数据只挂载 data/ 且只读: 容器里不会写任何东西, 备份怎么放都安全。
+services:
+  shiyu:
+    build: .
+    image: shiyu:latest
+    container_name: shiyu
+    # 只发布到本机回环 —— 聊天记录不该直接暴露到局域网
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - ./data:/data:ro
+    environment:
+      WECOM_DB: /data/wecom.sqlite
+      WECOM_MEDIA_ROOT: /data/media
+      TZ: Asia/Shanghai      # 不设的话容器按 UTC 跑, 界面上所有时间都会差 8 小时
+    restart: unless-stopped
