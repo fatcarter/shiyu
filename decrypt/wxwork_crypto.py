@@ -151,6 +151,11 @@ def wal_frames(path: str):
 
     只取到最后一个 db_size!=0 的提交帧为止(之后的未提交帧一律忽略);
     每帧页数据 4096B 仍为密文, 由调用方按页号解密。
+
+    世代过滤: WAL 文件是**复用**的 —— checkpoint 后 SQLite 从文件头重新写当前世代,
+    盐值(salt)递增, 上一世代的旧帧仍残留在文件尾部。只有盐与 WAL 头一致的帧属于
+    当前世代, 遇到盐不匹配即停止扫描(同 SQLite walIndexRecover 的语义)。若不过滤,
+    残留的旧帧会把旧页覆盖到新解密出的主库上, 得到 "database disk image is malformed"。
     """
     import os
 
@@ -162,8 +167,9 @@ def wal_frames(path: str):
         magic = struct.unpack(">I", hdr[0:4])[0]
         if magic not in (0x377F0682, 0x377F0683):  # 非 WAL 文件
             return
+        salt = hdr[16:24]
         frame_sz = WAL_FRAME_HDR_SZ + PAGE_SZ
-        # 先定位最后一个提交帧(其帧头 db_size 字段 != 0)
+        # 先定位最后一个提交帧(其帧头 db_size 字段 != 0), 扫描范围止于当前世代末尾
         last_commit_end = 0
         off = WAL_HDR_SZ
         while off + frame_sz <= size:
@@ -173,6 +179,8 @@ def wal_frames(path: str):
                 break
             page_no, db_size = struct.unpack(">II", fh[0:8])
             if page_no == 0:  # 帧头损坏, 停止
+                break
+            if fh[8:16] != salt:  # 上一世代的残留帧, 当前世代到此结束
                 break
             off += frame_sz
             if db_size != 0:

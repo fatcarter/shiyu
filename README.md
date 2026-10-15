@@ -288,13 +288,23 @@ AES 块, 无需试解整库。`keys/wckey.c` 实现该比对, 支持按 `WCKEY_S
   `"SQLite format 3\0"`;
 - **WAL 必须合并**: 最新消息位于 `-wal` 文件中。WAL 头 32 字节明文, 每帧为 24 字节帧头
   (页号/提交后页数/盐/校验和)加 4096 字节加密页, 只取到最后一个 `db_size != 0` 的提交帧;
+- **WAL 按盐值(世代)过滤**: WAL 文件是复用的 —— checkpoint 后从文件头重写当前世代, 盐值
+  递增, 上一世代的旧帧残留在文件尾部。只有盐与 WAL 头一致的帧属于当前世代, 遇到盐不匹配
+  即停止扫描(同 SQLite `walIndexRecover` 语义)。不过滤的话, 残留旧帧会覆盖新解出的主库,
+  报 `database disk image is malformed`;
 - 合并 WAL 后需把头中 18/19 字节由 2(WAL)改回 1(回滚日志), 否则没有配对 `-shm` 文件的
   明文库无法被 sqlite3 只读打开;
+- **合并顺序是先并 WAL 再校验**: 主库自身完好不代表数据最新, 先校验主库、通过就跳过 WAL
+  会静默丢掉最新消息。若快照的库与 WAL 不同代导致合并后校验不过, 退回只解主库的版本;
 - **并发写入竞态**: 应用运行时会持续写入。解密前以 APFS 克隆方式快照, 先克隆 WAL 再克隆
   主库, 且要求期间 WAL 的 size/mtime/inode 未发生变化, 否则重试(最多 3 次)。
 
 `decrypt/decrypt_all.py` 对每个库执行 `PRAGMA quick_check`, 结论写入
-`data/plaintext/manifest.json`。
+`data/plaintext/manifest.json`。口径上, 除 `ok` 外还接受一类**环境限制**: 企业微信的 FTS
+虚表声明了外部分词器(`icu`、自研 `WWFts5Tokenizer`), 本机 SQLite 注册表里没有, 遍历这些
+虚表必然失败(报 `unknown tokenizer: xxx`, 或 FTS5 加载失败时抬升的 `SQL logic error`)。
+仅当库中确实声明了外部分词器时才放行; 真正的损坏(`database disk image is malformed`、
+`*** in database main ***`)照旧判为失败。
 
 ### 消息正文解析
 

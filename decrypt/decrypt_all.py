@@ -20,11 +20,13 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
+from urllib.parse import quote
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -169,46 +171,109 @@ def snapshot_pair(src: str, snap: str) -> bool:
 
 
 def _quick_check(path: str) -> str:
+    """对明文库跑 PRAGMA quick_check, 返回 "ok" 或第一条问题文案。
+
+    用进程内 sqlite3 而非 sqlite3 CLI: CLI 会把错误包成 "Parse error in 3rd command
+    line argument: ...", 前缀随 CLI 版本变化, 判定文案会被污染。
+    """
     try:
-        r = subprocess.run(
-            ["sqlite3", "-readonly", path, "PRAGMA quick_check;"],
-            capture_output=True, text=True, timeout=3600,
-        )
-        out = (r.stdout or r.stderr).strip().splitlines()
-        return out[0] if out else "unknown"
-    except Exception as e:
+        conn = sqlite3.connect("file:" + quote(os.path.abspath(path)) + "?mode=ro", uri=True)
+    except sqlite3.Error as e:
         return f"check-error: {e}"
+    try:
+        rows = conn.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.Error as e:
+        return str(e).strip() or type(e).__name__
+    except Exception as e:  # noqa: BLE001
+        return f"check-error: {e}"
+    finally:
+        conn.close()
+    out = [str(r[0]).strip() for r in rows if r and r[0] is not None]
+    return out[0] if out else "unknown"
+
+
+# SQLite 内置分词器; 其余(icu / 企业微信 WWFts5Tokenizer 等)都要外部注册
+_BUILTIN_TOKENIZERS = {"unicode61", "ascii", "porter", "trigram"}
+_TOKENIZER_RX = re.compile(
+    r"USING\s+fts[3-5]\s*\([^)]*?tokenize\s*=?\s*'?([A-Za-z0-9_]+)", re.I | re.S
+)
+
+
+def _has_foreign_tokenizer(path: str) -> bool:
+    """库中是否存在声明了非内置分词器的 FTS 虚表。"""
+    try:
+        conn = sqlite3.connect("file:" + quote(os.path.abspath(path)) + "?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        for (sql,) in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE sql LIKE '%USING FTS%'"
+            " OR sql LIKE '%USING fts%'"
+        ).fetchall():
+            m = _TOKENIZER_RX.search(sql or "")
+            if m and m.group(1).lower() not in _BUILTIN_TOKENIZERS:
+                return True
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return False
+
+
+def check_ok(path: str, chk: str) -> bool:
+    """quick_check 文案是否可接受。
+
+    "ok"=结构完好。另有一类是**本机环境限制**而非库损坏: 企业微信的 FTS 虚表声明了
+    外部分词器(icu / 自研 WWFts5Tokenizer), 本机 SQLite 注册表里没有, quick_check
+    遍历这些虚表必然失败 —— 报 "unknown tokenizer: xxx", 或 FTS5 加载失败时抬升的
+    通用 "SQL logic error"(不带分词器名)。两者都只在库里确实有外部分词器时放行,
+    真正的损坏("database disk image is malformed" / "*** in database main ***")照旧被判失败。
+    """
+    if chk == "ok":
+        return True
+    if chk != "SQL logic error" and "unknown tokenizer" not in chk:
+        return False
+    return _has_foreign_tokenizer(path)
 
 
 def decrypt_one(src: str, dst: str, raw_key: str, jobs: int, snap: str,
                 use_wal: bool, attempts: int = 3) -> dict:
     """带校验与重试的单个库解密: 直到 quick_check 通过或重试耗尽。
 
-    校验口径: "ok"=结构完好; "unknown tokenizer..."=库本身好但依赖 ICU 分词器(可接受)。
+    顺序很关键: **先叠加 WAL, 再整体校验**。WAL 里是比主库更新的已提交数据, 主库
+    自身完好并不代表数据是最新的 —— 先校验主库、通过就跳过 WAL 会静默丢掉最新消息。
+
+    竞态兜底: 快照的库与 WAL 若取自不同时刻(应用边写边 checkpoint), 合并后会校验
+    不过; 此时退回"只解主库"的版本(稍旧但自洽), 不把损坏副本交给下游。
+
+    校验口径见 check_ok(): "ok"=结构完好; 缺外部分词器的报错同样算通过。
     """
-    key = bytes.fromhex(raw_key)
     size = os.path.getsize(src)
     best = None
     for i in range(1, attempts + 1):
         stable = snapshot_pair(src, snap)
         st = decrypt_db(snap, dst, raw_key, jobs)
         finalize_plaintext(dst)
-        chk = _quick_check(dst)
-        ok = chk == "ok" or chk.startswith("unknown tokenizer")
-        rec = {"size": size, **st, "snapshot_stable": stable, "quick_check": chk, "attempts": i}
-        if ok:
-            best = rec
-            break
-        if use_wal and os.path.exists(snap + "-wal") and stable:
-            w = apply_wal(dst, snap + "-wal", key)
+        rec = {"size": size, **st, "snapshot_stable": stable, "attempts": i}
+        if use_wal and stable and os.path.exists(snap + "-wal"):
+            rec.update(apply_wal(dst, snap + "-wal", raw_key))
             finalize_plaintext(dst)
-            chk2 = _quick_check(dst)
-            ok2 = chk2 == "ok" or chk2.startswith("unknown tokenizer")
-            rec.update({**w, "quick_check": chk2, "wal_applied": True})
-            if ok2:
-                best = rec
+            chk = _quick_check(dst)
+            if check_ok(dst, chk):
+                best = {**rec, "wal_applied": True, "quick_check": chk, "check_ok": True}
                 break
+            print(f"    警告: {os.path.basename(dst)} 合并 WAL 后校验不过"
+                  f"({chk}), 退回未合并版本", file=sys.stderr)
+            for k in ("wal_frames", "wal_last_page", "db_size_pages"):
+                rec.pop(k, None)
+            st = decrypt_db(snap, dst, raw_key, jobs)  # 重新解出主库, 丢弃已合并的改动
+            finalize_plaintext(dst)
+            rec.update({**st, "wal_applied": False})
+        chk = _quick_check(dst)
+        rec.update({"quick_check": chk, "check_ok": check_ok(dst, chk)})
         best = rec  # 记录最后一次(失败)结果
+        if rec["check_ok"]:
+            break
     return best or {}
 
 
@@ -289,7 +354,7 @@ def main() -> int:
             rec = decrypt_one(src, dst, key, args.jobs, snap, use_wal=not args.no_wal)
             rec.update({"src": src, "out": dst, "kcv": kcv, "key_name": desc})
             manifest.append(rec)
-            mark = "✅" if rec.get("quick_check", "").startswith(("ok", "unknown tokenizer")) else "⚠️"
+            mark = "✅" if rec.get("check_ok") else "⚠️"
             print(f"  {mark} {rel}  {rec.get('size',0)/1048576:.1f}MB 页{rec.get('pages')} "
                   f"WAL{rec.get('wal_frames',0)}帧 stable={rec.get('snapshot_stable')} "
                   f"试{rec.get('attempts')}次 quick_check={rec.get('quick_check')}  ({time.time()-t0:.0f}s)",
@@ -297,7 +362,7 @@ def main() -> int:
 
     mf = os.path.join(args.out, "manifest.json")
     json.dump(manifest, open(mf, "w"), ensure_ascii=False, indent=2)
-    ok = sum(1 for r in manifest if r["quick_check"] in ("ok", "skipped(big)"))
+    ok = sum(1 for r in manifest if r.get("check_ok"))
     print(f"\n完成: {len(manifest)} 个库, {ok} 个通过/跳过校验, 用时 {time.time()-t0:.0f}s")
     print(f"manifest: {mf}")
     return 0
